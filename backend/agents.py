@@ -14,7 +14,8 @@ MERMAID_RULES = """Mermaid rules (the diagram MUST render):
 - Put EVERY node label in double quotes: A["Label text"]. Never use parentheses, brackets or quotes inside a label.
 - Use simple ASCII ids (A, B, C1). One statement per line. No markdown fences, no comments.
 - Allowed kinds: flowchart TD, flowchart LR, mindmap, timeline, sequenceDiagram.
-- mindmap: indent with 2 spaces, plain text nodes, root like root((Topic)).
+- mindmap: first line `mindmap`, then EVERY node indented at least 2 spaces (root like `  root((Topic))`), children indented deeper.
+- flowchart: every node id must be unique; never reuse an id for a different label.
 - timeline: first line `timeline`, then `title X`, then `2001 : event`."""
 
 
@@ -22,7 +23,11 @@ def clean_mermaid(code: str) -> str:
     """Models often double-escape newlines or wrap code in fences; undo that."""
     code = (code or "").replace("\\n", "\n").replace("\\t", "  ").strip()
     code = re.sub(r"^```(?:mermaid)?\s*|\s*```$", "", code).strip()
-    return code
+    lines = code.split("\n")
+    # Mermaid mindmaps need every node indented under the `mindmap` line; models put the root at col 0.
+    if lines[0].strip() == "mindmap" and len(lines) > 1 and not lines[1].startswith(" "):
+        lines = [lines[0]] + ["  " + l for l in lines[1:]]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- Planner
@@ -92,18 +97,23 @@ async def researcher(topic: str, plan: dict, emit: Emit, max_steps: int = 6) -> 
             messages.append({"role": "tool", "tool_call_id": t.id,
                              "content": json.dumps(result)[:5000]})
     if len(pages) < 2:  # model under-fetched: top up from the plan's queries
-        hits = []
-        for q in [*plan["search_queries"], topic]:
-            hits += await wikipedia_search(q, 1)
-        for h in hits:
-            if len(pages) >= 3:
-                break
-            if h["title"] in pages:
-                continue
-            await emit({"type": "log", "agent": "researcher", "text": f'read page: "{h["title"]}"'})
-            p = await wikipedia_page(h["title"])
-            if p["text"]:
-                pages[p["title"]] = p
+        try:
+            hits = []
+            for q in [*plan["search_queries"], topic]:
+                hits += await wikipedia_search(q, 1)
+            for h in hits:
+                if len(pages) >= 3:
+                    break
+                if h["title"] in pages:
+                    continue
+                await emit({"type": "log", "agent": "researcher", "text": f'read page: "{h["title"]}"'})
+                p = await wikipedia_page(h["title"])
+                if p["text"]:
+                    pages[p["title"]] = p
+        except Exception as exc:
+            await emit({"type": "log", "agent": "researcher", "text": f"lookup failed: {exc}"[:120]})
+    if not pages:
+        raise RuntimeError("Could not fetch any Wikipedia pages (rate-limited?). Try again in a moment.")
     material = "\n\n".join(f"## {p['title']}\n{p['text']}" for p in pages.values())
     notes = await llm.ask_json(
         "You are a research agent. Distil the source material into study notes. "
@@ -134,18 +144,23 @@ async def explainer(topic: str, plan: dict, research: dict, emit: Emit) -> dict:
 
 # ------------------------------------------------------------ Quiz Master
 async def quiz_master(topic: str, research: dict, emit: Emit, n: int = 8) -> dict:
-    data = await llm.ask_json(
-        "You are a quiz-master agent. Write multiple-choice questions that test understanding, not trivia, "
-        "using only the notes. Mix easy and hard. "
-        f'Reply as JSON: {{"questions": [{{"question": str, "options": [exactly 4 strings], '
-        f'"answer_index": 0-3, "explanation": str}}]}} with {n} questions. Vary the position of the correct answer.',
-        f"Topic: {topic}\n\n{_notes_blob(research)}")
-    good = []
-    for q in data.get("questions", []):
-        if (isinstance(q.get("options"), list) and len(q["options"]) == 4
-                and isinstance(q.get("answer_index"), int) and 0 <= q["answer_index"] < 4):
-            good.append(q)
-    return {"questions": good}
+    best: list[dict] = []
+    for attempt in range(2):
+        data = await llm.ask_json(
+            "You are a quiz-master agent. Write multiple-choice questions that test understanding, not trivia, "
+            "using only the notes. Mix easy and hard. "
+            f'Reply as JSON: {{"questions": [{{"question": str, "options": [exactly 4 strings], '
+            f'"answer_index": 0-3, "explanation": str}}]}} with {n} questions. Vary the position of the correct answer.',
+            f"Topic: {topic}\n\n{_notes_blob(research)}")
+        good = [q for q in data.get("questions", [])
+                if isinstance(q.get("options"), list) and len(q["options"]) == 4
+                and isinstance(q.get("answer_index"), int) and 0 <= q["answer_index"] < 4]
+        if len(good) > len(best):
+            best = good
+        if len(best) >= 5:
+            break
+        await emit({"type": "log", "agent": "quiz", "text": f"only {len(good)} valid questions, regenerating"})
+    return {"questions": best}
 
 
 # -------------------------------------------------------------- Diagrammer

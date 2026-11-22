@@ -48,17 +48,26 @@ def parse_json(text: str) -> dict:
         return json.loads(m.group(0))
 
 
-async def ask_json(system: str, user: str, retries: int = 2) -> dict:
-    """One call that must return a JSON object. Re-asks if the JSON is broken."""
-    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-    last = None
+async def ask_json(system: str, user: str, retries: int = 3) -> dict:
+    """One call that must return a JSON object. Survives broken JSON: re-asks, and if the
+    provider's strict JSON mode rejects the output (400), retries in plain mode and parses by hand."""
+    messages = [{"role": "system", "content": system + "\nReply with ONLY a JSON object."},
+                {"role": "user", "content": user}]
+    strict, last = True, None
     for _ in range(retries + 1):
-        resp = await call(messages, response_format={"type": "json_object"})
+        try:
+            kw = {"response_format": {"type": "json_object"}} if strict else {}
+            resp = await call(messages, **kw)
+        except Exception as exc:
+            if "400" in str(exc) or "json" in str(exc).lower():
+                strict, last = False, exc
+                continue
+            raise
         text = resp.choices[0].message.content
         try:
             return parse_json(text)
         except json.JSONDecodeError as exc:
             last = exc
             messages += [{"role": "assistant", "content": text or ""},
-                         {"role": "user", "content": "That was not valid JSON. Reply with ONLY the JSON object."}]
+                         {"role": "user", "content": "That was not valid JSON. Reply with ONLY the JSON object; escape newlines inside strings as \\n."}]
     raise ValueError(f"model did not return valid JSON: {last}")
