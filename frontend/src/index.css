@@ -1,0 +1,5 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+:root { color-scheme: dark; }
+body { margin: 0; background: #0b0d14; color: #e6e8ef; font-family: ui-sans-serif, system-ui, sans-serif; }
